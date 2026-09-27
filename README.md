@@ -1,0 +1,1 @@
+# claude_godmode
