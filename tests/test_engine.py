@@ -33,9 +33,12 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="godmode-test-")
         self.env = dict(os.environ)
-        for k in ("GODMODE_CHILD", "FAKE_SCENARIO", "FAKE_NO_SCHEMA", "FAKE_RATE_LIMIT_EVERY", "FAKE_LOG"):
+        for k in ("GODMODE_CHILD", "FAKE_SCENARIO", "FAKE_NO_SCHEMA", "FAKE_RATE_LIMIT_EVERY", "FAKE_LOG",
+                  "FAKE_LOW_CONF", "FAKE_USAGE_LIMIT_ONCE", "FAKE_FAIL_ONCE_AGENT", "CLAUDE_CODE_SESSION_ID"):
             self.env.pop(k, None)
         self.env["FAKE_COUNTER"] = os.path.join(self.tmp, "counter")
+        self.env["GODMODE_RL_PAUSE"] = "0.2"
+        self.env["CLAUDE_CONFIG_DIR"] = os.path.join(self.tmp, "claude-config")
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -195,6 +198,16 @@ class TestCodeMode(Base):
         self.assertEqual(p.returncode, 0)
         self.assertEqual(self.git(repo, "for-each-ref", "refs/godmode"), "")
 
+    @unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
+    def test_project_reached_through_a_symlink(self):
+        # macOS keeps temp dirs under /var -> /private/var; paths must not be compared textually
+        repo = self.make_repo()
+        link = os.path.join(self.tmp, "link-to-proj")
+        os.symlink(repo, link)
+        run = self.make_run(3, mode="code", cwd=link, verify_command='"%s" test_calc.py' % sys.executable)
+        r = self.run_ok(run, "--worktree-root", os.path.join(self.tmp, "wt"), FAKE_SCENARIO="code")
+        self.assertTrue(r["winner"]["verify"]["passed"])
+
     def test_all_failing_verification_triggers_refinement(self):
         repo = self.make_repo()
         run = self.make_run(3, mode="code", cwd=repo, verify_command='"%s" -c "import sys; sys.exit(1)"' % sys.executable)
@@ -280,6 +293,85 @@ class TestControls(Base):
         r = self.run_ok(run, "--concurrency", "64")
         self.assertEqual(r["winner"]["first_choice_votes"], 2000)
         self.assertLess(time.time() - start, 300)
+
+
+class TestModelAndConfidence(Base):
+    def fake_session(self, model):
+        sid = "11111111-2222-3333-4444-555555555555"
+        d = os.path.join(self.tmp, "claude-config", "projects", "-some-project")
+        os.makedirs(d)
+        with open(os.path.join(d, sid + ".jsonl"), "w") as f:
+            f.write(json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n")
+            f.write(json.dumps({"type": "assistant", "message": {"model": "claude-older", "content": []}}) + "\n")
+            f.write(json.dumps({"type": "assistant", "message": {"model": model, "content": []}}) + "\n")
+            f.write(json.dumps({"type": "assistant", "message": {"model": "<synthetic>", "content": []}}) + "\n")
+        return sid
+
+    def calls(self, log):
+        with open(log) as f:
+            return [json.loads(line) for line in f]
+
+    def test_all_agents_use_the_session_model(self):
+        sid = self.fake_session("claude-session-model")
+        log = os.path.join(self.tmp, "calls.jsonl")
+        r = self.run_ok(self.make_run(9), CLAUDE_CODE_SESSION_ID=sid, FAKE_LOG=log)
+        self.assertEqual({c["model"] for c in self.calls(log)}, {"claude-session-model"})
+        self.assertEqual(r["models"]["requested"], "claude-session-model")
+        self.assertEqual(r["models"]["source"], "session")
+        self.assertEqual(list(r["models"]["used_by_calls"]), ["claude-session-model"])
+        self.assertFalse(r["models"]["mismatch"])
+
+    def test_explicit_model_wins_and_is_kept_on_resume(self):
+        sid = self.fake_session("claude-session-model")
+        run = self.make_run(6)
+        log = os.path.join(self.tmp, "calls.jsonl")
+        p = self.engine("run", "--run-dir", run, "--model", "claude-chosen", "--pilot", "2",
+                        CLAUDE_CODE_SESSION_ID=sid, FAKE_LOG=log)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        r = self.run_ok(run, CLAUDE_CODE_SESSION_ID=sid, FAKE_LOG=log)  # resume without --model
+        self.assertEqual({c["model"] for c in self.calls(log)}, {"claude-chosen"})
+        self.assertEqual(r["models"]["requested"], "claude-chosen")
+
+    def test_unsure_voters_recheck_at_higher_effort(self):
+        log = os.path.join(self.tmp, "calls.jsonl")
+        run = self.make_run(8)
+        r = self.run_ok(run, FAKE_LOW_CONF="1", FAKE_LOG=log)
+        conf = r["contest"]["confidence"]
+        self.assertEqual(conf["rechecked_votes"], conf["votes"])
+        self.assertEqual(conf["mean_confidence"], 90)
+        rechecks = [c for c in self.calls(log) if c["effort"] == "xhigh"]
+        ballots = sum(len(os.listdir(os.path.join(run, "votes", st))) for st in os.listdir(os.path.join(run, "votes")))
+        self.assertEqual(len(rechecks), ballots)  # every unsure vote, qualifying and final, was re-examined
+        v = load(os.path.join(run, "votes", "f0", "agent-00001.json"))
+        self.assertTrue(v["rechecked"])
+        self.assertEqual(v["first_vote"]["confidence"], 40)
+
+    def test_usage_limit_waits_instead_of_failing(self):
+        r = self.run_ok(self.make_run(5), FAKE_USAGE_LIMIT_ONCE=os.path.join(self.tmp, "limit"))
+        self.assertEqual(r["failures"]["solve"], 0)
+        self.assertGreaterEqual(r["usage"]["usage_limit_waits"], 1)
+
+    def test_retry_sweep_recovers_failed_agents(self):
+        r = self.run_ok(self.make_run(6), FAKE_FAIL_ONCE_AGENT="4")
+        self.assertEqual(r["failures"]["solve"], 0)
+
+    def test_run_lock_and_status_wait(self):
+        run = self.make_run(3)
+        live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            with open(os.path.join(run, "engine.lock"), "w") as f:
+                json.dump({"pid": live.pid, "started": "now"}, f)
+            p = self.engine("run", "--run-dir", run)
+            self.assertEqual(p.returncode, 5, p.stderr)
+            self.assertIn("already running", p.stderr)
+        finally:
+            live.kill()
+            live.wait()
+        self.run_ok(run)  # dead pid: lock is taken over
+        start = time.time()
+        p = self.engine("status", "--run-dir", run, "--wait", "30")
+        self.assertLess(time.time() - start, 20)  # finished run: returns at once
+        self.assertIn("finished", p.stdout)
 
 
 class TestVotingUnits(unittest.TestCase):

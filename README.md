@@ -48,7 +48,7 @@ It is built for problems a single agent fails on, and to be economical at scale:
 | **Verify before voting.** Code solutions are run against a test, and passing ones are preferred. | Plain majority voting plateaus, and can even get *worse* as calls increase on hard tasks. Filtering on execution closes much of the gap between "some agent found it" and "we picked it". Sources: Chen et al. 2024, *Are More LLM Calls All You Need?*; Brown et al. 2024, *Large Language Monkeys*; AlphaCode; CodeT. |
 | **Semantic clustering** of answer keys. | Equivalent answers phrased differently would otherwise split the vote. This is the idea behind Universal Self-Consistency. |
 | **Strategy diversity, not temperature.** The orchestrator writes distinct workflows. | Diverse plans beat repeated sampling. Sources: PlanSearch, DIV-SE. |
-| **Every agent votes from a fresh context, using its own judging angle.** | A voter doesn't know which candidate is its own, which removes self-preference bias (Panickssery et al. 2024). The different angles (correctness tracer, edge-case hunter and others) make the votes more independent. |
+| **Every agent votes from a fresh context, using its own judging angle, and has to be sure.** For each candidate it states the core claim, the concrete evidence and a verdict, then makes a head-to-head comparison and gives a calibrated confidence. Unsure voters re-examine the ballot at higher effort. | A voter doesn't know which candidate is its own, which removes self-preference bias (Panickssery et al. 2024). The different angles (correctness tracer, edge-case hunter and others) make the votes more independent. |
 | **Anonymised, rotated ballots.** Each finalist appears in every position equally often, and supporter counts are hidden. | Controls position bias and herding (Zheng et al. 2023). |
 | **Rubric first, then ranking.** | Checking each candidate against the criteria before comparing them resists distractors. |
 | **Adaptive refinement only when contested:** the winner has under 50% of votes, leads by under 15%, or fails verification. | Recursive Self-Aggregation and Self-MoA get gains from synthesis rounds. CATTS-style gating spends that compute only where it pays off. Open debate is avoided because it mostly adds nothing beyond voting (*Debate or Vote*, 2025). |
@@ -57,85 +57,149 @@ It is built for problems a single agent fails on, and to be economical at scale:
 
 ---
 
-## Installation (step by step)
+## Installation
 
-### 1. Requirements
+- **Claude Desktop** users: follow [Install for Claude Desktop](#install-for-claude-desktop-step-by-step) below.
+- **Terminal (`claude` CLI)** users: see [Install for the terminal](#install-for-the-terminal-claude-cli).
+- **Both:** one install covers both. They share the same `~/.claude/skills` folder.
 
-| Requirement | Check | Install |
+### Install for Claude Desktop (step by step)
+
+`/godmode` runs in the **Code** tab of the Claude Desktop app, in a **Local** session on your computer. It doesn't
+work in Chat or Cowork, and it isn't meant for Cloud sessions, which don't read `~/.claude/skills`.
+
+#### What you need
+
+| | macOS | Windows |
 |---|---|---|
-| Claude Code (CLI, or Claude Desktop with Claude Code) | `claude --version` | `npm install -g @anthropic-ai/claude-code`, or <https://claude.com/claude-code> |
-| Signed in | `claude` → `/login` | |
-| Python 3.8+ | `python3 --version` (Windows: `python --version`) | <https://python.org> |
-| git | `git --version` | Needed for code tasks: isolated worktrees and patches |
+| Claude Desktop app with a **Pro, Max, Team or Enterprise** plan (the Code tab needs one) | [claude.com/download](https://claude.com/download) | [claude.com/download](https://claude.com/download) (x64 or ARM64) |
+| **Python 3.8 or newer** | Open **Terminal** and run `python3 --version`. If macOS offers to install the *Command Line Developer Tools*, click **Install**; that gives you Python 3 and git. You can also install from [python.org](https://www.python.org/downloads/). | Install from [python.org](https://www.python.org/downloads/) or the Python install manager. In the installer, tick **"Add python.exe to PATH"**. Check it by opening **PowerShell** and running `python --version`. |
+| **Git** (code tasks use git worktrees) | Included with the Command Line Developer Tools (`git --version`) | Install [Git for Windows](https://git-scm.com/download/win). Claude Code also uses its Git Bash as its shell. |
 
-**Claude Desktop.** The Claude Code tab in Claude Desktop reads the same `~/.claude/skills` folder, so the global install below also covers Desktop. You don't need a separate `claude` on your PATH: the engine uses the Claude binary that Desktop is already running, found through `CLAUDE_CODE_EXECPATH`.
+You do **not** need Node.js or a separate `claude` install. The Desktop app includes Claude Code, and `/godmode`
+uses the copy that is already running.
 
-### 2A. Global install (every project, CLI and Desktop). Recommended.
+#### Step 1: Download /godmode
 
-**macOS / Linux / WSL**
-```bash
-git clone https://github.com/robenn044/claude_godmode.git
-cd claude_godmode
-./install.sh                      # copies skills/godmode → ~/.claude/skills/godmode
+Either:
+- **ZIP:** open <https://github.com/robenn044/claude_godmode>, click **Code → Download ZIP**, and unzip it, for
+  example into your Downloads folder, or
+- **git:** `git clone https://github.com/robenn044/claude_godmode.git`
+
+#### Step 2: Run the installer
+
+**macOS**
+1. Open the unzipped `claude_godmode` folder in Finder.
+2. **Right-click `install-mac.command` → Open → Open.** Right-clicking is needed the first time because the file
+   was downloaded from the internet.
+3. A Terminal window opens, installs the skill to `~/.claude/skills/godmode`, and prints a check. Press Enter to close it.
+
+   Terminal alternative: `bash ~/Downloads/claude_godmode-main/install.sh`
+
+**Windows**
+1. Open the unzipped `claude_godmode` folder in File Explorer.
+2. **Double-click `install-windows.bat`.** If SmartScreen warns you, click **More info → Run anyway**.
+3. The skill is installed to `%USERPROFILE%\.claude\skills\godmode` and a check is printed. Press any key to close.
+
+   PowerShell alternative: `powershell -ExecutionPolicy Bypass -File "$HOME\Downloads\claude_godmode-main\install.ps1"`
+
+The check at the end prints lines like these:
 ```
-Without cloning: `curl -fsSL https://raw.githubusercontent.com/robenn044/claude_godmode/main/install.sh | bash`
-
-**Windows (PowerShell)**
-```powershell
-git clone https://github.com/robenn044/claude_godmode.git
-cd claude_godmode
-powershell -ExecutionPolicy Bypass -File .\install.ps1   # → %USERPROFILE%\.claude\skills\godmode
-```
-Without cloning: `irm https://raw.githubusercontent.com/robenn044/claude_godmode/main/install.ps1 | iex`
-
-**Manual install:** copy `skills/godmode/` to `~/.claude/skills/godmode/`.
-
-### 2B. One project only (shared with your team through git)
-
-```bash
-/path/to/claude_godmode/install.sh --project     # → ./.claude/skills/godmode
-git add .claude/skills/godmode && git commit -m "Add /godmode skill"
+godmode engine 2.1.0 | python 3.12.4 | Darwin
+claude CLI: ... (2.x.x (Claude Code))        <- may say NOT FOUND when run outside Claude; that is fine
 ```
 
-### 2C. As a plugin
+#### Step 3: Restart Claude Desktop
 
-Run these in Claude Code:
-```
-/plugin marketplace add robenn044/claude_godmode
-/plugin install godmode@claude-godmode
-```
-Invoke it as `/godmode`, or as `/godmode:godmode` if the name clashes with another command.
+**Fully quit** the app so it reloads skills and your PATH, then reopen it:
+- **macOS:** Cmd+Q.
+- **Windows:** File → Exit, or right-click the tray icon → Quit.
 
-> **Before this is merged into `main`:** install from the branch. After cloning, run `git checkout <branch>` before `./install.sh`. For the one-liners, fetch the branch's `install.sh` and pipe it to `GODMODE_REF=<branch> bash`, or pass `-Ref <branch>` to `install.ps1`.
+#### Step 4: Open a Local Code session in your project
 
-### 3. Verify the install
+1. Click the **Code** tab at the top.
+2. In the environment selector, choose **Local**.
+3. Click **Select folder** and pick your project folder. A git repository is best for code tasks.
+4. Pick the **model** from the dropdown next to the send button. **Every `/godmode` agent and voter will use this
+   same model.**
+5. Optionally, open the effort menu (Cmd+Shift+E on macOS, Ctrl+Shift+E on Windows) and choose `high`, `xhigh` or
+   `max` for hard problems. The agents inherit it.
 
-1. Restart Claude Code, or open a new Desktop session.
-2. Type `/` and check that `godmode` appears in the list.
-3. Run:
-   ```bash
-   python3 ~/.claude/skills/godmode/scripts/godmode_engine.py preflight
+#### Step 5: Check that /godmode is available
+
+1. Type `/` in the prompt box, or click **+ → Slash commands**. You should see **godmode**. If it's missing, start
+   a new session with **+ New session**, or type `/reload-skills`.
+2. Run a tiny test:
    ```
-   It should print your Claude CLI path, version and features.
-4. Try a small run: `/godmode 3 What is 17 * 23?`
+   /godmode 3 What is 17 * 23?
+   ```
+3. Claude asks permission before it runs the engine's `python3 …/godmode_engine.py` commands. Approve them. To
+   avoid the prompts on big runs, pick the **Accept edits** or **Auto** permission mode next to the send button,
+   or allow the command permanently in `~/.claude/settings.json`:
+   ```json
+   { "permissions": { "allow": ["Bash(python3 *godmode_engine.py*)", "Bash(python *godmode_engine.py*)"] } }
+   ```
+4. You should get a report saying 3 agents voted, with the answer **391**, the model used and the cost.
 
-### Update or uninstall
+#### Step 6: Use it
 
-- Update: re-run `./install.sh`.
-- Uninstall: `./install.sh --uninstall` (add `--project` for a per-project install), or `/plugin uninstall godmode@claude-godmode`.
+```
+/godmode 20 Fix the flaky test in tests/test_pool.py
+/godmode 200 --budget 50 Find the root cause of the memory leak in the ingest worker
+/godmode resume          <- continues an interrupted run (for example after closing the app)
+```
 
----
+For runs of 50 or more agents, `/godmode` first runs a 5-agent pilot and shows the projected cost. Keep the app open
+and the computer awake during big runs. If a run is interrupted, `/godmode resume` continues where it stopped.
+
+#### Update or uninstall (Desktop)
+
+- **Update:** download the new ZIP and run the installer again, then start a new Code session.
+- **Uninstall:** delete the `godmode` folder:
+  - macOS: `~/.claude/skills/godmode`
+  - Windows: `%USERPROFILE%\.claude\skills\godmode`
+
+  Or run `install.sh --uninstall` / `install.ps1 -Uninstall`.
+
+### Install for the terminal (`claude` CLI)
+
+1. Install Claude Code (`npm install -g @anthropic-ai/claude-code`, or <https://claude.com/claude-code>) and sign
+   in (`claude` → `/login`). You also need Python 3.8+ and git.
+2. Install the skill globally, to `~/.claude/skills/godmode`, for every project:
+   ```bash
+   git clone https://github.com/robenn044/claude_godmode.git && cd claude_godmode && ./install.sh
+   # or, without cloning:
+   curl -fsSL https://raw.githubusercontent.com/robenn044/claude_godmode/main/install.sh | bash
+   ```
+   On Windows PowerShell, use `.\install.ps1`, or
+   `irm https://raw.githubusercontent.com/robenn044/claude_godmode/main/install.ps1 | iex`.
+3. Start `claude` in your project and type `/godmode 3 What is 17 * 23?`.
+
+**Other install options**
+- **Just one project, shared with your team through git:**
+  ```bash
+  /path/to/claude_godmode/install.sh --project && git add .claude/skills/godmode
+  ```
+- **As a plugin:** run `/plugin marketplace add robenn044/claude_godmode`, then
+  `/plugin install godmode@claude-godmode`. In Desktop, use **+ → Plugins → Add plugin**. It is invoked as
+  `/godmode`, or as `/godmode:godmode` if another command uses the same name.
+- **Check the install at any time:**
+  ```bash
+  python3 ~/.claude/skills/godmode/scripts/godmode_engine.py preflight
+  ```
 
 ## Usage
 
 | Flag | Meaning |
 |---|---|
 | `X` | Number of agents, **1 to 10000**. Exactly X agents solve and all X vote. |
-| `--model M` / `--vote-model M` | Model for solving and for voting, e.g. `opus`, `sonnet`, `haiku` or a full ID. |
+| `--model M` / `--vote-model M` | Override the model. **By default every agent and every voter uses the model selected for your session**, i.e. the model dropdown in Claude Desktop or `/model` in the CLI. The report lists the models the calls actually used. |
 | `--effort E` | Worker effort: `low`, `medium`, `high`, `xhigh` or `max`. The orchestrator chooses one if you don't. |
 | `--concurrency N` | Maximum agents running at once. Default 8, maximum 256. It halves automatically on rate limits and recovers slowly. |
 | `--budget USD` | Hard spending stop. Re-run the same command later to resume. |
 | `--max-refine N` / `--no-refine` | Controls the adaptive refinement rounds. Default is at most 1. |
+| `--vote-confidence C` | Voters must state a calibrated confidence. Below C (default 70), a voter re-examines its ballot at `xhigh` effort, and only that second vote counts. |
+| `resume` | `/godmode resume` continues the newest unfinished run. Nothing is redone. |
 | `--yes` | Skip the confirmation. Without it, you are asked to confirm when X ≥ 500 or the projected cost is over $50. |
 | `--native` | Run without the engine, using in-session subagents. Limited to 50 agents. |
 
@@ -191,7 +255,7 @@ The manifest format is described in [`skills/godmode/references/manifest.md`](sk
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -v     # 30+ tests, no API calls (tests/fake_claude.py)
+python3 -m unittest discover -s tests -v     # 40 tests, no API calls (tests/fake_claude.py)
 claude plugin validate .
 ```
 CI runs the suite on Linux, macOS and Windows. [`evals/`](evals/) contains orchestrator scenarios in the Agent Skills evaluation format.

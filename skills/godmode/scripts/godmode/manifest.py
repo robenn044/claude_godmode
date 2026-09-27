@@ -34,9 +34,9 @@ DEFAULTS = {
     "worker_tools": None,
     "worker_subagents": False,
     "worker_mcp": False,
-    "voter_tools": "",
+    "voter_tools": None,  # None: "Read,Grep,Glob" in code mode (voters can inspect the project), "" otherwise
     "worker_effort": "high",
-    "voter_effort": "medium",
+    "voter_effort": "high",
     "model": None,
     "vote_model": None,
     "fallback_model": None,
@@ -117,6 +117,8 @@ def normalise(m, run_dir):
     for s in m["strategies"]:
         s["workflow"] = s.get("workflow") or s.get("instructions")
     m["run_dir"] = os.path.abspath(run_dir)
+    if m.get("voter_tools") is None:
+        m["voter_tools"] = "Read,Grep,Glob" if m["mode"] == "code" else ""
 
 
 def solve_hash(m):

@@ -29,6 +29,9 @@ STRIP_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID")
 # Tools auto-approved for workers ("agents may do everything"). acceptEdits + an explicit
 # allowlist grants full autonomy and, unlike bypassPermissions, also works when running as root.
 FULL_ACCESS_TOOLS = "Bash Edit Write Read Grep Glob NotebookEdit WebSearch WebFetch TodoWrite"
+# Seconds all calls pause after a rate-limit signal (tests shorten it).
+RL_PAUSE = float(os.environ.get("GODMODE_RL_PAUSE", "10"))
+_LIMIT_WORDS = ("usage limit", "rate limit", "rate_limit", "limit reached", "overloaded", "too many requests")
 
 
 def find_claude(explicit=None):
@@ -41,6 +44,37 @@ def find_claude(explicit=None):
         if c and os.path.isfile(c) and (os.access(c, os.X_OK) or c.endswith(".py")):
             return os.path.abspath(c)
     return None
+
+
+def claude_config_dir():
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+
+
+def detect_session_model(session_id=None):
+    """Best-effort: the model of the Claude Code session (CLI or Claude Desktop) that launched us.
+
+    Claude Code sets CLAUDE_CODE_SESSION_ID in every Bash-tool subprocess, and keeps the session
+    transcript at <config>/projects/<project>/<session-id>.jsonl, where each assistant message
+    records the model that produced it. Returns None if anything is missing."""
+    sid = session_id or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not sid or not re.match(r"^[0-9A-Za-z-]+$", sid):
+        return None
+    try:
+        import glob
+        paths = glob.glob(os.path.join(claude_config_dir(), "projects", "*", sid + ".jsonl"))
+        if not paths:
+            return None
+        path = max(paths, key=os.path.getmtime)
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 4 * 1024 * 1024))
+            tail = f.read().decode("utf-8", "replace")
+        models = [m for m in re.findall(r'"model"\s*:\s*"([^"]+)"', tail)
+                  if m and not m.startswith("<") and m != "synthetic"]
+        return models[-1] if models else None
+    except (OSError, ValueError):
+        return None
 
 
 def claude_argv(claude):
@@ -159,11 +193,19 @@ class AdaptiveLimiter(object):
             self.active -= 1
             self.cond.notify_all()
 
-    def on_rate_limit(self, pause=10.0):
+    def on_rate_limit(self, pause=None):
+        pause = RL_PAUSE if pause is None else pause
         with self.cond:
             self.limit = max(1, self.limit // 2)
             self.streak = 0
             self.pause_until = max(self.pause_until, time.time() + pause)
+
+    def pause_until_time(self, when):
+        """Usage limit hit: hold every new call until `when` (epoch seconds)."""
+        with self.cond:
+            self.pause_until = max(self.pause_until, when)
+            self.limit = max(1, self.limit // 2)
+            self.streak = 0
 
     def on_success(self):
         with self.cond:
@@ -208,10 +250,11 @@ class BudgetExceeded(Exception):
 
 
 class CallError(Exception):
-    def __init__(self, msg, retryable=True, rate_limited=False):
+    def __init__(self, msg, retryable=True, rate_limited=False, reset_at=None):
         Exception.__init__(self, msg)
         self.retryable = retryable
         self.rate_limited = rate_limited
+        self.reset_at = reset_at
 
 
 class _UnknownOption(Exception):
@@ -230,9 +273,9 @@ class CallSpec(object):
 
 
 class CallResult(object):
-    def __init__(self, data, text, cost, usage, num_turns, duration):
+    def __init__(self, data, text, cost, usage, num_turns, duration, models=()):
         self.data, self.text, self.cost, self.usage = data, text, cost, usage
-        self.num_turns, self.duration = num_turns, duration
+        self.num_turns, self.duration, self.models = num_turns, duration, list(models)
 
 
 def parse_output(text, schema):
@@ -268,7 +311,7 @@ def parse_output(text, schema):
 
 
 class ClaudeRunner(object):
-    def __init__(self, claude, concurrency=8, retries=2, budget=None, log=print, bypass=False):
+    def __init__(self, claude, concurrency=8, retries=2, budget=None, log=print, bypass=False, max_wait_hours=6.0):
         if not claude:
             raise GodmodeError("Could not find the `claude` CLI. Install Claude Code or pass --claude-bin.")
         self.claude = claude
@@ -278,11 +321,14 @@ class ClaudeRunner(object):
         self.budget = budget
         self.log = log
         self.bypass = bypass
+        self.max_wait = max_wait_hours * 3600.0
+        self.waited = 0.0
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.procs = set()
         self.stats = {"calls": 0, "failed_calls": 0, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0,
-                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "rate_limit_events": 0}
+                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "rate_limit_events": 0,
+                      "models": {}, "usage_limit_waits": 0}
 
     # ------------------------------------------------------------------ public
     def add_prior_cost(self, cost):
@@ -336,7 +382,17 @@ class ClaudeRunner(object):
                 with self.lock:
                     self.stats["failed_calls"] += 1
                 if e.rate_limited:
-                    self.limiter.on_rate_limit(pause=15 * (attempt + 1))
+                    wait = (e.reset_at - time.time() + 30) if e.reset_at else None
+                    if wait and wait > 0 and self.waited + wait <= self.max_wait:
+                        # A plan/usage limit with a known reset: wait for it instead of failing the agent.
+                        with self.lock:
+                            self.waited += wait
+                            self.stats["usage_limit_waits"] += 1
+                        self.limiter.pause_until_time(e.reset_at + 30)
+                        self.log("usage limit reached; pausing all calls until %s" %
+                                 time.strftime("%H:%M", time.localtime(e.reset_at + 30)))
+                        continue
+                    self.limiter.on_rate_limit(pause=max(RL_PAUSE, RL_PAUSE * 1.5 * (attempt + 1)))
                 if not e.retryable:
                     raise
             finally:
@@ -407,7 +463,7 @@ class ClaudeRunner(object):
                                 stderr=subprocess.PIPE, **popen_kwargs())
         with self.lock:
             self.procs.add(proc)
-        box = {"result": None, "first": False, "tail": [], "retry_rl": False}
+        box = {"result": None, "first": False, "tail": [], "retry_rl": False, "resets_at": None}
         err_chunks = []
 
         def read_stdout():
@@ -427,6 +483,10 @@ class ClaudeRunner(object):
                     box["first"] = True
                     if on_first:
                         on_first()
+                elif t == "rate_limit_event":
+                    info = ev.get("rate_limit_info") or {}
+                    if info.get("status") == "rejected" and info.get("resetsAt"):
+                        box["resets_at"] = float(info["resetsAt"])
                 elif t == "system" and ev.get("subtype") == "api_retry":
                     blob = json.dumps(ev).lower()
                     if any(k in blob for k in ("429", "529", "rate_limit", "overloaded")) and not box["retry_rl"]:
@@ -471,23 +531,39 @@ class ClaudeRunner(object):
             raise CallError("bypassPermissions refused (root); falling back to acceptEdits + allowlist")
         res = box["result"]
         if res is None:
-            raise CallError("no result (exit %s): %s" % (proc.returncode, (stderr.strip() or "\n".join(box["tail"]))[-600:]))
+            msg = (stderr.strip() or "\n".join(box["tail"]))[-600:]
+            limited = any(w in msg.lower() for w in _LIMIT_WORDS)
+            raise CallError("no result (exit %s): %s" % (proc.returncode, msg), rate_limited=limited,
+                            reset_at=_reset_time(msg, box["resets_at"]) if limited else None)
         cost = float(res.get("total_cost_usd") or 0.0)
         usage = res.get("usage") or {}
+        models = sorted((res.get("modelUsage") or {}).keys())
         with self.lock:
             s = self.stats
             s["calls"] += 1
             s["cost_usd"] += cost
             for k in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
                 s[k] += int(usage.get(k) or 0)
+            for mdl in models:
+                s["models"][mdl] = s["models"].get(mdl, 0) + 1
         if res.get("is_error") or res.get("subtype") not in (None, "success"):
             status = res.get("api_error_status")
-            rl = status in (429, 529, "429", "529")
+            detail = "%s %s %s" % (res.get("subtype"), status or "",
+                                   "; ".join(res.get("errors") or [])[:400] or str(res.get("result") or "")[:400])
+            rl = status in (429, 529, "429", "529") or any(w in detail.lower() for w in _LIMIT_WORDS)
             budget = res.get("subtype") == "error_max_budget_usd"
-            raise CallError("%s %s %s" % (res.get("subtype"), status or "", "; ".join(res.get("errors") or [])[:400]),
-                            retryable=not budget, rate_limited=rl)
+            raise CallError(detail, retryable=not budget, rate_limited=rl,
+                            reset_at=_reset_time(detail, box["resets_at"]) if rl else None)
         data = res.get("structured_output")
         text = str(res.get("result") or "")
         if not isinstance(data, dict):
             data = parse_output(text, spec.schema) if spec.schema is not None else None
-        return CallResult(data, text, cost, usage, res.get("num_turns"), time.time() - started)
+        return CallResult(data, text, cost, usage, res.get("num_turns"), time.time() - started, models)
+
+
+def _reset_time(text, resets_at=None):
+    """Epoch seconds when a usage limit resets, from a rate_limit_event or a '...|<epoch>' message."""
+    if resets_at:
+        return resets_at
+    m = re.search(r"\|(\d{10})\b", text or "")
+    return float(m.group(1)) if m else None

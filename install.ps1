@@ -47,7 +47,13 @@ if ($Tmp) { Remove-Item -Recurse -Force $Tmp }
 Write-Host "Installed /godmode -> $Dest"
 
 $Py = $null
-foreach ($c in @("python", "py", "python3")) { if (Get-Command $c -ErrorAction SilentlyContinue) { $Py = $c; break } }
+foreach ($c in @("python", "py", "python3")) {
+  if (Get-Command $c -ErrorAction SilentlyContinue) {
+    # skip the Microsoft Store "python" stub, which exists even when Python is not installed
+    $v = & $c -c "import sys; print(sys.version_info[0] * 100 + sys.version_info[1])" 2>$null
+    if ($LASTEXITCODE -eq 0 -and [int]$v -ge 308) { $Py = $c; break }
+  }
+}
 if (-not $Py) { Write-Warning "Python 3.8+ not found. Install it from https://python.org (the swarm engine needs it)." }
 if ($Py) { & $Py (Join-Path $Dest "scripts\godmode_engine.py") preflight }
 if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {

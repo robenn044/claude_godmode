@@ -1,6 +1,6 @@
 {
   "name": "godmode",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "/godmode X [prompt]: run 1-10000 independent Claude agents on one hard task. The swarm verifies and clusters their solutions, every agent votes, the most-voted solution wins, and contested votes trigger an adaptive refinement round.",
   "author": {
     "name": "robenn044"

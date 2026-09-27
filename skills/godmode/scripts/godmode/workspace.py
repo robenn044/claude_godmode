@@ -33,7 +33,14 @@ def repo_root(path):
         code, out = git(["rev-parse", "--show-toplevel"], path, check=False)
     except OSError:
         return None
-    return os.path.abspath(out.strip()) if code == 0 and out.strip() else None
+    return os.path.normpath(out.strip()) if code == 0 and out.strip() else None
+
+
+def repo_prefix(path):
+    """Where `path` sits inside its repo, as git sees it ("" at the root). Asking git avoids
+    path arithmetic that breaks on symlinks (/var -> /private/var) and Windows 8.3 short names."""
+    code, out = git(["rev-parse", "--show-prefix"], path, check=False)
+    return out.strip().rstrip("/") if code == 0 else ""
 
 
 def ensure_excluded(project, pattern=".godmode/"):
@@ -46,7 +53,8 @@ def ensure_excluded(project, pattern=".godmode/"):
         return
     common = common.strip()
     common = common if os.path.isabs(common) else os.path.join(root, common)
-    rel = os.path.relpath(os.path.join(project, pattern), root).replace(os.sep, "/")
+    prefix = repo_prefix(project)
+    rel = (prefix + "/" if prefix else "") + pattern.rstrip("/")
     path = os.path.join(common, "info", "exclude")
     try:
         existing = open(path, "r", encoding="utf-8").read() if os.path.exists(path) else ""
@@ -78,7 +86,7 @@ class Workspace(object):
         self.run_id = "%s-%s" % (os.path.basename(run_dir.rstrip("/\\")), sha(run_dir, 6))
         self.root = root or os.path.join(tempfile.gettempdir(), "godmode", self.run_id)
         self.repo = repo_root(self.project)
-        self.rel = os.path.relpath(self.project, self.repo) if self.repo else "."
+        self.rel = (repo_prefix(self.project) or ".") if self.repo else "."
         self.state_path = os.path.join(run_dir, "workspace.json")
         self.state = read_json(self.state_path, {}) or {}
 

@@ -21,7 +21,11 @@ def build_report(swarm, rounds):
     ranking, t, c = last["ranking"], last["tally"], last["contest"]
     w = by_id[ranking[0]]
     total = c["total_votes"] or swarm.n
-    stats = dict(swarm.runner.stats)
+    stats = swarm._stats()
+    expected = swarm.state.get("model")
+    used = stats.get("models") or {}
+    # modelUsage may list a helper model next to the main one; only a missing main model is a mismatch
+    mismatch = bool(expected and used and not any(expected in k or k in expected for k in used))
     cache_in = stats["cache_read_input_tokens"] + stats["cache_creation_input_tokens"] + stats["input_tokens"]
     rep_dir = "refine/r%d" % int(w["rep"].split("-")[0][1:]) if w["rep"].startswith("r") else "agents"
     rep_agent = w["rep"].rsplit("-", 2)[-2] + "-" + w["rep"].rsplit("-", 1)[-1]
@@ -55,6 +59,9 @@ def build_report(swarm, rounds):
             "patch_file": patch_path if w.get("has_patch") else None, "round": last["round"],
         },
         "contest": c,
+        "models": {"requested": expected, "source": swarm.state.get("model_source"),
+                   "session_model": swarm.state.get("session_model"), "vote_model": swarm.state.get("vote_model"),
+                   "used_by_calls": used, "mismatch": mismatch},
         "rounds": [{"round": r["round"], "solutions": r["solutions"], "clusters": len(r["clusters"]),
                     "eligible": r["eligible"], "qualifying": (r["qualify"] or [])[:30], "finalists": r["finalists"],
                     "final_tally": table(r), "contest": r["contest"], "unanimous": r["unanimous"],
@@ -68,6 +75,7 @@ def build_report(swarm, rounds):
             "cache_creation_input_tokens": stats["cache_creation_input_tokens"],
             "cache_hit_ratio": round(stats["cache_read_input_tokens"] / float(cache_in), 3) if cache_in else None,
             "rate_limit_events": stats["rate_limit_events"],
+            "usage_limit_waits": stats.get("usage_limit_waits", 0),
         },
         "finished_at": now_iso(),
     }
@@ -75,6 +83,8 @@ def build_report(swarm, rounds):
 
 def render_winner(r):
     w, c, u = r["winner"], r["contest"], r["usage"]
+    md = r.get("models") or {}
+    cf = c.get("confidence") or {}
     status = "unanimous" if r["rounds"][-1]["unanimous"] else (
         "CONTESTED (%s)" % "; ".join(c["reasons"]) if c["contested"] else "clear majority")
     v = w.get("verify")
@@ -89,6 +99,16 @@ def render_winner(r):
             r["agents"], r["failures"]["solve"], u["claude_calls"], u["cost_usd"],
             "n/a" if u["cache_hit_ratio"] is None else "%.0f%%" % (100 * u["cache_hit_ratio"])),
     ]
+    lines.append("- **Model:** %s (%s)%s" % (
+        md.get("requested") or "CLI default", md.get("source") or "?",
+        "; calls used: " + ", ".join("%s x%d" % kv for kv in sorted((md.get("used_by_calls") or {}).items()))
+        if md.get("used_by_calls") else ""))
+    if md.get("mismatch"):
+        lines.append("- **WARNING:** some calls ran on a different model than requested (see report.json models)")
+    if cf.get("mean_confidence") is not None:
+        lines.append("- **Voter confidence:** mean %s%%, winner's voters %s%%, re-checked votes: %d/%d" % (
+            cf["mean_confidence"], cf.get("winner_voters_mean_confidence"), cf.get("rechecked_votes", 0),
+            cf.get("votes", 0)))
     if w.get("patch_file"):
         lines.append("- **Patch:** `%s` (apply with the engine's `apply` command)" % w["patch_file"])
     for rd in r["rounds"]:

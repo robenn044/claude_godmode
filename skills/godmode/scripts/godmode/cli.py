@@ -6,10 +6,11 @@ import os
 import platform
 import signal
 import sys
+import time
 
 from . import __version__
 from . import manifest as mf
-from .claude import Capabilities, find_claude
+from .claude import Capabilities, detect_session_model, find_claude
 from .util import GodmodeError, read_json, write_text
 from .workspace import Workspace, repo_root
 
@@ -27,6 +28,11 @@ def cmd_preflight(a):
             out.append("CLI features: %s" % ("all present" if not missing else "missing " + ", ".join(missing)))
         else:
             out.append("claude CLI: NOT FOUND -> use native mode (references/native-mode.md)")
+        sm = detect_session_model()
+        out.append("session model: %s (agents default to it)" % (sm or "not detected; pass --model <your model id>"))
+        eff = os.environ.get("CLAUDE_EFFORT")
+        if eff:
+            out.append("session effort: %s" % eff)
         cwd = os.getcwd()
         root = repo_root(cwd)
         out.append("cwd: %s | git repo: %s" % (cwd, root or "no"))
@@ -63,12 +69,62 @@ def _swarm(a):
     return Swarm(a.run_dir, a)
 
 
+def _pid_alive(pid):
+    if pid <= 0 or pid == os.getpid():
+        return False
+    if os.name == "nt":
+        import ctypes
+        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(h)
+        return code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+class RunLock(object):
+    """One engine per run directory: a second `run` on a live run would duplicate work and spend."""
+
+    def __init__(self, run_dir, force=False):
+        self.path = os.path.join(run_dir, "engine.lock")
+        self.force = force
+
+    def __enter__(self):
+        info = read_json(self.path)
+        if info and _pid_alive(int(info.get("pid", 0))) and not self.force:
+            raise GodmodeError("another engine (pid %s, started %s) is already running this run. Use "
+                               "`status --wait` to follow it, or pass --force if that process is gone."
+                               % (info.get("pid"), info.get("started")), 5)
+        write_text(self.path, json.dumps({"pid": os.getpid(), "started": time.strftime("%Y-%m-%d %H:%M:%S")}))
+        return self
+
+    def __exit__(self, *exc):
+        info = read_json(self.path)
+        if info and info.get("pid") == os.getpid():
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+
+
 def cmd_run(a):
     s = _swarm(a)
     if a.dry_run:
         print(json.dumps(s.dry_run(), indent=2))
         return 0
+    with RunLock(s.run_dir, a.force):
+        return _run_locked(s, a)
 
+
+def _run_locked(s, a):
     def on_sigint(signum, frame):
         sys.stderr.write("\ngodmode: stopping agents (state is saved; re-run to resume)...\n")
         if s.runner:
@@ -86,13 +142,26 @@ def cmd_run(a):
 
 
 def cmd_status(a):
-    p = read_json(os.path.join(a.run_dir, "progress.json"))
+    """Print progress. With --wait N, block up to N seconds until the run finishes or its engine
+    stops, so the orchestrator can check in periodically without a sleep loop."""
+    deadline = time.time() + max(0, a.wait or 0)
+    while True:
+        p = read_json(os.path.join(a.run_dir, "progress.json"))
+        lock = read_json(os.path.join(a.run_dir, "engine.lock"))
+        running = bool(lock and _pid_alive(int(lock.get("pid", 0))))
+        done = bool(p and p.get("phase") == "done")
+        if done or not running or time.time() >= deadline:
+            break
+        time.sleep(min(5.0, max(0.1, deadline - time.time())))
     if not p:
-        print("no progress yet in %s" % a.run_dir)
+        print("no progress yet in %s (engine running: %s)" % (a.run_dir, running))
         return 0
+    p["engine_running"] = running
     print(json.dumps(p, indent=2))
-    if p.get("phase") == "done":
+    if done:
         print("finished: %s" % os.path.join(a.run_dir, "WINNER.md"))
+    elif not running:
+        print("the engine is not running; re-run the same `run` command to resume")
     return 0
 
 
@@ -150,6 +219,8 @@ def build_parser():
         p.add_argument("--worktree-root", default=None)
         if name == "validate":
             p.add_argument("--baseline", action="store_true")
+        if name == "status":
+            p.add_argument("--wait", type=float, default=0, help="block up to N seconds until the run finishes")
 
     r = sub.add_parser("run", help="run or resume the swarm described by <run-dir>/manifest.json")
     r.add_argument("--run-dir", required=True)
@@ -168,6 +239,11 @@ def build_parser():
     r.add_argument("--refine-fraction", type=float, default=0.1, help="share of agents that refine (min 4)")
     r.add_argument("--contest-share", type=float, default=0.5, help="refine if winner share is below this")
     r.add_argument("--contest-margin", type=float, default=0.15, help="refine if top-2 margin is below this")
+    r.add_argument("--vote-confidence", type=int, default=70,
+                   help="a voter below this confidence (0-100) re-examines its ballot at higher effort (default 70)")
+    r.add_argument("--max-wait-hours", type=float, default=6.0,
+                   help="max total time to wait for plan usage-limit resets instead of failing (default 6)")
+    r.add_argument("--force", action="store_true", help="take over the run lock of a dead engine")
     r.add_argument("--no-semantic-cluster", action="store_true")
     r.add_argument("--timeout", type=int, default=3600, help="seconds per solver call (default 3600)")
     r.add_argument("--vote-timeout", type=int, default=900)

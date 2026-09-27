@@ -7,8 +7,11 @@ import os
 import re
 import sys
 import threading
+import time
 
 _LOG_LOCK = threading.Lock()
+_WRITE_LOCKS = {}
+_WRITE_LOCKS_GUARD = threading.Lock()
 
 
 def now_iso():
@@ -16,26 +19,46 @@ def now_iso():
 
 
 def read_json(path, default=None):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return default
+    for attempt in range(5):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except PermissionError:  # Windows: a writer is replacing the file right now
+            time.sleep(0.05 * (attempt + 1))
+        except (OSError, ValueError):
+            return default
+    return default
 
 
 def write_json(path, data):
     write_text(path, json.dumps(data, indent=2, ensure_ascii=False))
 
 
+def _lock_for(path):
+    with _WRITE_LOCKS_GUARD:
+        return _WRITE_LOCKS.setdefault(os.path.abspath(path), threading.Lock())
+
+
 def write_text(path, text):
-    """Write atomically so an interrupted run never leaves a half-written file."""
+    """Write atomically so an interrupted run never leaves a half-written file.
+
+    Writers of the same path are serialised, and os.replace is retried because on Windows it
+    fails with PermissionError while another process (e.g. `status`) has the file open."""
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
     tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    with _lock_for(path):
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        for attempt in range(40):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == 39:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
 
 
 def read_text(path, default=""):

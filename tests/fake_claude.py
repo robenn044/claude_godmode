@@ -11,6 +11,9 @@ Behaviour knobs (env):
   FAKE_NO_SCHEMA  1 -> --json-schema unsupported (help omits it); 2 -> advertised but rejected at runtime
   FAKE_RATE_LIMIT_EVERY  N -> every Nth call emits an api_retry rate-limit event
   FAKE_LOG        path -> append one JSON line per call (argv flags, cwd, prompt head)
+  FAKE_LOW_CONF   1 -> judges answer with 40% confidence, and 90% when asked to re-check
+  FAKE_USAGE_LIMIT_ONCE  path -> the first call hits a plan usage limit (resets in 1 s)
+  FAKE_FAIL_ONCE_AGENT   N -> agent N's first solve attempts fail (exercises the retry sweep)
 """
 import hashlib
 import json
@@ -55,6 +58,8 @@ if counter_file:
 if log:
     with open(log, "a") as f:
         f.write(json.dumps({"flags": [a for a in args if a.startswith("--")], "cwd": os.getcwd(),
+                            "model": args[args.index("--model") + 1] if "--model" in args else None,
+                            "effort": args[args.index("--effort") + 1] if "--effort" in args else None,
                             "prompt_head": prompt[:120], "system_sha": hashlib.sha256(system.encode()).hexdigest()}) + "\n")
 
 
@@ -64,6 +69,13 @@ def emit(obj):
 
 
 emit({"type": "system", "subtype": "init"})
+limit_marker = os.environ.get("FAKE_USAGE_LIMIT_ONCE")
+if limit_marker and not os.path.exists(limit_marker):
+    open(limit_marker, "w").close()
+    emit({"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "resetsAt": int(time.time()) + 1}})
+    emit({"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429,
+          "result": "Claude usage limit reached|%d" % (int(time.time()) + 1), "total_cost_usd": 0})
+    sys.exit(1)
 every = int(os.environ.get("FAKE_RATE_LIMIT_EVERY", "0") or 0)
 if every and call_no and call_no % every == 0:
     emit({"type": "system", "subtype": "api_retry", "error_status": 429, "error": "rate_limit"})
@@ -114,8 +126,13 @@ def judge():
     else:
         pick = max(cands, key=lambda ct: score(ct[1]))[0]
     ranking = [pick] + [c for c in ids if c != pick]
-    return {"assessments": [{"id": c, "verdict": "correct" if c == pick else "flawed", "note": "fake note %s" % c}
-                            for c in ids], "ranking": ranking, "vote": pick, "reason": "fake judge"}
+    conf = 90
+    if os.environ.get("FAKE_LOW_CONF") == "1" and "<your_first_assessment>" not in prompt:
+        conf = 40
+    return {"assessments": [{"id": c, "verdict": "correct" if c == pick else "flawed", "note": "fake note %s" % c,
+                             "evidence": "fake evidence %s" % c} for c in ids],
+            "head_to_head": "fake comparison", "ranking": ranking, "vote": pick, "confidence": conf,
+            "reason": "fake judge"}
 
 
 def cluster():
@@ -133,13 +150,25 @@ elif "<candidates>" in prompt:
     out = judge()
 else:
     m = re.search(r"You are agent #(\d+)", prompt)
-    out = solver(int(m.group(1)) if m else 1, "<refinement_round>" in prompt)
+    num = int(m.group(1)) if m else 1
+    fail_agent = os.environ.get("FAKE_FAIL_ONCE_AGENT")
+    if fail_agent and int(fail_agent) == num and "<refinement_round>" not in prompt:
+        marker = os.environ["FAKE_COUNTER"] + ".fail%d" % num
+        tries = int(open(marker).read()) if os.path.exists(marker) else 0
+        if tries < 3:  # fails every attempt of the first pass (1 try + 2 retries)
+            open(marker, "w").write(str(tries + 1))
+            emit({"type": "result", "subtype": "error_during_execution", "is_error": True, "errors": ["boom"],
+                  "total_cost_usd": 0})
+            sys.exit(1)
+    out = solver(num, "<refinement_round>" in prompt)
     if "GODMODE SWARM PROTOCOL" not in system and "GODMODE SWARM PROTOCOL" not in prompt:
         out["summary"] += " (NO BRIEF)"
 if os.environ.get("FAKE_SLEEP"):
     time.sleep(float(os.environ["FAKE_SLEEP"]))
 
+model = args[args.index("--model") + 1] if "--model" in args else "fake-default"
 result = {"type": "result", "subtype": "success", "is_error": False, "num_turns": 1, "total_cost_usd": 0.001,
+          "modelUsage": {model: {"inputTokens": 10, "outputTokens": 5}},
           "usage": {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 100,
                     "cache_creation_input_tokens": 20}}
 if no_schema:

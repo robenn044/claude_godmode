@@ -61,7 +61,17 @@ def interpret(data, order):
             verdicts[c] = a.get("verdict")
             if a.get("note"):
                 notes[c] = str(a["note"])[:500]
-    return {"vote": vote, "ranking": ranking, "verdicts": verdicts, "notes": notes,
+    try:
+        conf = max(0, min(100, int(data.get("confidence"))))
+    except (TypeError, ValueError):
+        conf = None
+    for a in data.get("assessments") or []:
+        c = labels.get(str(a.get("id", "")).strip().upper()[:1]) if isinstance(a, dict) else None
+        if c and a.get("evidence") and c not in notes:
+            notes[c] = str(a["evidence"])[:500]
+    return {"vote": vote, "ranking": ranking, "verdicts": verdicts, "notes": notes, "confidence": conf,
+            "vote_label": str(data.get("vote", "")).strip().upper()[:1],
+            "head_to_head": str(data.get("head_to_head", ""))[:1500],
             "reason": str(data.get("reason", ""))[:1000]}
 
 
@@ -111,7 +121,17 @@ def order_final(t, clusters_by_id):
     return sorted(t, key=key)
 
 
-def contest(t, ranking, clusters_by_id, has_verifier, share_threshold=0.5, margin_threshold=0.15):
+def confidence_stats(votes, winner=None):
+    confs = [v["confidence"] for v in votes if v.get("confidence") is not None]
+    win = [v["confidence"] for v in votes if v.get("confidence") is not None and v["vote"] == winner]
+    return {"mean_confidence": round(sum(confs) / float(len(confs)), 1) if confs else None,
+            "winner_voters_mean_confidence": round(sum(win) / float(len(win)), 1) if win else None,
+            "rechecked_votes": sum(1 for v in votes if v.get("rechecked")),
+            "votes": len(votes)}
+
+
+def contest(t, ranking, clusters_by_id, has_verifier, share_threshold=0.5, margin_threshold=0.15,
+            votes=None, unsure_threshold=60):
     total = sum(s["first"] for s in t.values())
     first = t[ranking[0]]["first"] if ranking else 0
     second = t[ranking[1]]["first"] if len(ranking) > 1 else 0
@@ -129,5 +149,10 @@ def contest(t, ranking, clusters_by_id, has_verifier, share_threshold=0.5, margi
             reasons.append("no candidate passed verification")
         elif not (clusters_by_id[ranking[0]].get("verify") or {}).get("passed"):
             reasons.append("the winner failed verification")
+    cs = confidence_stats(votes or [], ranking[0] if ranking else None)
+    wc = cs["winner_voters_mean_confidence"]
+    if total >= 3 and wc is not None and wc < unsure_threshold:
+        reasons.append("the winner's voters are unsure (mean confidence %.0f%%)" % wc)
     return {"total_votes": total, "winner_share": round(share, 4), "margin": round(margin, 4),
+            "confidence": cs,
             "entropy_bits": round(entropy, 3), "contested": bool(reasons), "reasons": reasons}

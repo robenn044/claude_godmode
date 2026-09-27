@@ -31,9 +31,10 @@ The engine reads `RUN/manifest.json`. `python3 ENGINE validate --run-dir RUN` ch
 | `worker_tools` | string \| null | all | Restricts the built-in tools workers get, for example `"Bash,Read,Edit,Write,Grep,Glob"`. |
 | `worker_subagents` | bool | false | Allows workers to spawn their own subagents. This multiplies cost. |
 | `worker_mcp` | bool | false | Loads the user's MCP servers in every worker. This is slower. |
-| `voter_tools` | string | `""` | Tools the voters get. Leave it empty unless judging really needs to read files, for example `"Read,Grep,Glob"`. |
-| `worker_effort` / `voter_effort` | effort | high / medium | One of `low`, `medium`, `high`, `xhigh`, `max`. |
-| `model` / `vote_model` / `fallback_model` | string \| null | null | Model aliases or IDs. The CLI flags override these. |
+| `voter_tools` | string \| null | auto | Tools the voters get, so they can check claims against the project. `null` means `"Read,Grep,Glob"` in code mode and none in reason mode. |
+| `worker_effort` / `voter_effort` | effort | high / high | One of `low`, `medium`, `high`, `xhigh`, `max`. A voter below `--vote-confidence` re-checks at `xhigh`. |
+| `model` / `vote_model` | string \| null | session model | Leave these null so every agent runs on the session's model. They are resolved in this order: `--model`, manifest, the model recorded for the run, then the detected session model. |
+| `fallback_model` | string \| null | null | Leave this null. A fallback would put some agents on a different model. |
 
 ## How fields map to prompts (prompt caching)
 

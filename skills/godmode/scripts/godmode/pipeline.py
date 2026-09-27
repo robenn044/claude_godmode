@@ -9,12 +9,14 @@ import math
 import os
 import random
 import threading
+import time
 
 from . import manifest as mf
-from .claude import BudgetExceeded, CallSpec, ClaudeRunner, PrimerGate, Stopped, find_claude
+from .claude import (BudgetExceeded, CallSpec, ClaudeRunner, PrimerGate, Stopped, detect_session_model,
+                     find_claude)
 from .cluster import build_clusters, pool_hash
-from .prompts import (JUDGE_SYSTEM, LABELS, WORKER_SCHEMA, assignment, ballot_block, refine_prompt,
-                      shared_brief, verification_text, vote_prompt, vote_schema, worker_prompt)
+from .prompts import (JUDGE_SYSTEM, LABELS, WORKER_SCHEMA, assignment, ballot_block, recheck_prompt,
+                      refine_prompt, shared_brief, verification_text, vote_prompt, vote_schema, worker_prompt)
 from .report import build_report, render_winner
 from .util import GodmodeError, Logger, agent_name, now_iso, read_json, read_text, write_json, write_text
 from .voting import (contest, interpret, order_final, qualify_ballots, qualify_score, rotations, tally,
@@ -52,13 +54,29 @@ class Swarm(object):
         self.runner = None
         self.ws = None
         self.brief_path = os.path.join(self.run_dir, "shared_brief.md")
+        self.io_lock = threading.RLock()
+        self._resolve_models()
+
+    def _resolve_models(self):
+        """Every agent runs on the same model as the session that launched the swarm, unless told
+        otherwise: --model, then manifest.model, then the model recorded for this run, then the
+        launching Claude Code / Claude Desktop session's model."""
+        o, m, st = self.opts, self.m, self.state
+        detected = detect_session_model()
+        model = o.model or m.get("model") or st.get("model") or detected
+        source = ("--model" if o.model else "manifest" if m.get("model") else "run state" if st.get("model")
+                  else "session" if detected else "claude default")
+        vote_model = o.vote_model or m.get("vote_model") or model
+        st.update({"model": model, "model_source": source, "vote_model": vote_model,
+                   "session_model": detected or st.get("session_model")})
+        m["model"], m["vote_model"] = model, vote_model  # in memory only; the clusterer reads these
 
     # ------------------------------------------------------------------ setup
     def _setup(self):
         if self.runner is None:
             self.runner = ClaudeRunner(find_claude(self.opts.claude_bin), concurrency=self.opts.concurrency,
                                        retries=self.opts.retries, budget=self.opts.budget, log=self.log,
-                                       bypass=self.opts.bypass)
+                                       bypass=self.opts.bypass, max_wait_hours=self.opts.max_wait_hours)
             self.runner.stats.update(self.state.get("stats") or {})
         brief = shared_brief(self.m)
         if read_text(self.brief_path) != brief:  # keep bytes stable across resumes (prompt cache)
@@ -70,22 +88,45 @@ class Swarm(object):
             snap = self.ws.snapshot()
             self.log("workspace snapshot: %s (worktrees in %s)" % (snap, self.ws.root))
 
+    def _stats(self):
+        if not self.runner:
+            return {}
+        with self.runner.lock:
+            s = dict(self.runner.stats)
+            s["models"] = dict(s.get("models") or {})
+        return s
+
     def _save(self, phase=None):
-        if phase:
-            self.state["phase"] = phase
-        if self.runner:
-            self.state["stats"] = dict(self.runner.stats)
-        write_json(self.state_path, self.state)
+        with self.io_lock:
+            if phase:
+                self.state["phase"] = phase
+            if self.runner:
+                self.state["stats"] = self._stats()
+            write_json(self.state_path, self.state)
 
     def _progress(self, phase, done, total, failed, note=""):
-        s = dict(self.runner.stats) if self.runner else {}
-        write_json(os.path.join(self.run_dir, "progress.json"), {
-            "phase": phase, "done": done, "total": total, "failed": failed, "note": note,
-            "cost_usd": round(s.get("cost_usd", 0.0), 4), "calls": s.get("calls", 0),
-            "concurrency_now": self.runner.limiter.limit if self.runner else None,
-            "rate_limit_events": s.get("rate_limit_events", 0), "updated_at": now_iso(), "pid": os.getpid()})
+        s = self._stats()
+        lim = self.runner.limiter if self.runner else None
+        if lim and lim.pause_until > time.time() + 60 and not note:
+            note = "waiting for usage-limit reset until %s" % time.strftime("%H:%M", time.localtime(lim.pause_until))
+        with self.io_lock:
+            write_json(os.path.join(self.run_dir, "progress.json"), {
+                "phase": phase, "done": done, "total": total, "failed": failed, "note": note,
+                "cost_usd": round(s.get("cost_usd", 0.0), 4), "calls": s.get("calls", 0),
+                "concurrency_now": lim.limit if lim else None, "model": self.state.get("model"),
+                "rate_limit_events": s.get("rate_limit_events", 0), "updated_at": now_iso(), "pid": os.getpid()})
 
     def _pool(self, phase, items, fn, gate_for=None):
+        failed_items = []
+        n_failed = self._pool_pass(phase, items, fn, gate_for, failed_items)
+        if failed_items:  # one retry sweep for agents that failed (timeouts, transient errors)
+            self.log("%s: retrying %d failed item(s) once more" % (phase, len(failed_items)))
+            retry_failed = []
+            n_failed = self._pool_pass(phase + " (retry)", sorted(failed_items), fn, gate_for, retry_failed,
+                                       breaker=False)
+        return n_failed
+
+    def _pool_pass(self, phase, items, fn, gate_for, failed_items, breaker=True):
         total, done, failed = len(items), [0], [0]
         flags = {"budget": False, "stopped": False, "breaker": None}
         gates, lock = {}, threading.Lock()
@@ -106,8 +147,9 @@ class Swarm(object):
             except Exception as e:  # noqa: BLE001 - one agent failing must not sink the swarm
                 with lock:
                     failed[0] += 1
+                    failed_items.append(item)
                     # Circuit breaker: if the first calls all fail, the setup is broken; stop burning money.
-                    if failed[0] >= min(6, total) and done[0] == 0 and not flags["breaker"]:
+                    if breaker and failed[0] >= min(6, total) and done[0] == 0 and not flags["breaker"]:
                         flags["breaker"] = str(e)[:600]
                         self.runner.kill_all()
                 self.log("%s %s FAILED: %s" % (phase, item, str(e)[:400]))
@@ -143,7 +185,7 @@ class Swarm(object):
         return CallSpec(
             label, prompt, cwd, schema=WORKER_SCHEMA, append_file=self.brief_path, tools=m.get("worker_tools"),
             full_access=True, disallowed_tools=None if m.get("worker_subagents") else "Agent",
-            model=o.model or m.get("model"), fallback_model=m.get("fallback_model"),
+            model=m.get("model"), fallback_model=m.get("fallback_model"),
             effort=o.effort or m["worker_effort"], add_dirs=() if self.code else (m["cwd"],),
             strict_mcp=not m.get("worker_mcp"), max_turns=o.max_turns, max_budget=o.agent_budget, timeout=o.timeout)
 
@@ -175,6 +217,7 @@ class Swarm(object):
                "solution": str(d.get("solution", "")), "confidence": _int(d.get("confidence")),
                "checks_done": str(d.get("checks_done", "")), "patch": patch, "verify": verify,
                "cost_usd": res.cost, "num_turns": res.num_turns, "duration_s": round(res.duration, 1),
+               "models": res.models,
                "finished_at": now_iso()}
         if patch:
             write_text(os.path.join(directory, "patch.diff"), patch)
@@ -225,12 +268,29 @@ class Swarm(object):
         vt = m.get("voter_tools") or ""
         spec = CallSpec("%s-%s" % (stage, agent_name(voter)), vote_prompt(block, angle, what), self.run_dir,
                         schema=vote_schema(len(order)), system_prompt=JUDGE_SYSTEM, tools=vt,
-                        allowed_tools=vt or None, model=o.vote_model or m.get("vote_model") or o.model or m.get("model"),
+                        allowed_tools=vt or None, model=m.get("vote_model"),
                         fallback_model=m.get("fallback_model"), effort=m["voter_effort"],
                         add_dirs=(m["cwd"],) if vt else (), timeout=o.vote_timeout, judge=True)
         res = self.runner.run(spec, gate, validate=validate_vote(len(order)))
         rec = interpret(res.data, order)
-        rec.update({"voter": voter, "ballot": order, "angle": angle, "cost_usd": res.cost})
+        cost, models = res.cost, list(res.models)
+        if rec["confidence"] is not None and rec["confidence"] < o.vote_confidence:
+            # The voter is unsure: make it look again, harder, before its vote counts.
+            first = dict(rec)
+            spec.prompt = recheck_prompt(spec.prompt, first)
+            spec.effort = "xhigh" if m["voter_effort"] in ("low", "medium", "high") else "max"
+            try:
+                res2 = self.runner.run(spec, None, validate=validate_vote(len(order)))
+                rec = interpret(res2.data, order)
+                rec["first_vote"] = {"vote": first["vote"], "confidence": first["confidence"]}
+                rec["rechecked"] = True
+                cost += res2.cost
+                models += res2.models
+            except (BudgetExceeded, Stopped):
+                raise
+            except Exception as e:  # noqa: BLE001 - keep the first, recorded-as-unsure vote
+                self.log("recheck of %s failed (%s); keeping its first vote" % (spec.label, str(e)[:200]))
+        rec.update({"voter": voter, "ballot": order, "angle": angle, "cost_usd": cost, "models": sorted(set(models))})
         write_json(path, rec)
 
     def _load_votes(self, stage):
@@ -393,7 +453,7 @@ class Swarm(object):
                 self._save("final r%d" % round_no)
                 ranking, t, votes = self.final(round_no, clusters, finalists)
                 unanimous = False
-            c = contest(t, ranking, by_id, self.has_verifier, o.contest_share, o.contest_margin)
+            c = contest(t, ranking, by_id, self.has_verifier, o.contest_share, o.contest_margin, votes=votes)
             if unanimous:
                 c["reasons"] = [r for r in c["reasons"] if "verification" in r]
                 c["contested"] = bool(c["reasons"])

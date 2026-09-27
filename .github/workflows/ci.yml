@@ -15,9 +15,12 @@ jobs:
           - { os: macos-latest, python: "3.12" }
           - { os: windows-latest, python: "3.12" }
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      PYTHONIOENCODING: utf-8
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - name: Configure git identity for fixtures
@@ -26,5 +29,7 @@ jobs:
           git config --global user.email ci@example.com
       - name: Compile
         run: python -m compileall -q skills/godmode/scripts tests
+      - name: Validate plugin manifests
+        run: python -c "import json; [json.load(open(p)) for p in ('.claude-plugin/plugin.json', '.claude-plugin/marketplace.json', 'evals/evals.json')]"
       - name: Tests (no API calls; uses tests/fake_claude.py)
         run: python -m unittest discover -s tests -v

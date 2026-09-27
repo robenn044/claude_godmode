@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "GODMODE: a multi-agent swarm skill for Claude Code that verifies, clusters and votes, returning the most-voted solution.",
-    "version": "2.0.0"
+    "version": "2.1.0"
   },
   "plugins": [
     {
       "name": "godmode",
       "source": "./",
       "description": "Run 1-10000 Claude agents on one task, verify and cluster their solutions, and let every agent vote. The most-voted solution wins.",
-      "version": "2.0.0"
+      "version": "2.1.0"
     }
   ]
 }
