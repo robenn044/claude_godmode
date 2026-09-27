@@ -1,0 +1,9 @@
+{
+  "name": "godmode",
+  "version": "1.0.0",
+  "description": "/godmode X [prompt]: spawn 1-10000 independent Claude agents on one task, let them all vote, and return the solution with the most votes.",
+  "author": { "name": "robenn044" },
+  "repository": "https://github.com/robenn044/claude_godmode",
+  "license": "MIT",
+  "keywords": ["multi-agent", "swarm", "voting", "ensemble", "orchestration"]
+}
