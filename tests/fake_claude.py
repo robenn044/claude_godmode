@@ -10,7 +10,7 @@ Behaviour knobs (env):
   FAKE_SCENARIO   consensus (default) | split | code
   FAKE_NO_SCHEMA  1 -> --json-schema unsupported (help omits it); 2 -> advertised but rejected at runtime
   FAKE_RATE_LIMIT_EVERY  N -> every Nth call emits an api_retry rate-limit event
-  FAKE_LOG        path -> append one JSON line per call (argv flags, cwd, prompt head)
+  FAKE_LOG        path -> write one JSON file per call into <path>.d/ (argv flags, cwd, prompt head)
   FAKE_LOW_CONF   1 -> judges answer with 40% confidence, and 90% when asked to re-check
   FAKE_USAGE_LIMIT_ONCE  path -> the first call hits a plan usage limit (resets in 1 s)
   FAKE_FAIL_ONCE_AGENT   N -> agent N's first solve attempts fail (exercises the retry sweep)
@@ -56,12 +56,14 @@ if counter_file:
     except OSError:
         pass
 if log:
-    with open(log, "a") as f:
-        f.write(json.dumps({"flags": [a for a in args if a.startswith("--")], "cwd": os.getcwd(),
-                            "model": args[args.index("--model") + 1] if "--model" in args else None,
-                            "effort": args[args.index("--effort") + 1] if "--effort" in args else None,
-                            "prompt_head": prompt[:120], "system_sha": hashlib.sha256(system.encode()).hexdigest()}) + "\n")
-
+    # one file per call: concurrent appends to a shared file can lose lines on Windows
+    os.makedirs(log + ".d", exist_ok=True)
+    rec = {"flags": [a for a in args if a.startswith("--")], "cwd": os.getcwd(),
+           "model": args[args.index("--model") + 1] if "--model" in args else None,
+           "effort": args[args.index("--effort") + 1] if "--effort" in args else None,
+           "prompt_head": prompt[:120], "system_sha": hashlib.sha256(system.encode()).hexdigest()}
+    with open(os.path.join(log + ".d", "%d-%d-%s.json" % (os.getpid(), time.time_ns(), os.urandom(4).hex())), "w") as f:
+        json.dump(rec, f)
 
 def emit(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
