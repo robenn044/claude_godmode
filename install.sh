@@ -76,17 +76,19 @@ done
 if [ -z "$PY" ]; then
   echo "WARNING: Python 3.8+ not found. Install it; the swarm engine needs it." >&2
 fi
+if [ -n "$PY" ]; then
+  "$PY" "$DEST/scripts/godmode_engine.py" preflight || true
+fi
 if ! command -v claude >/dev/null 2>&1; then
-  echo "WARNING: 'claude' CLI not on PATH. Install Claude Code: npm install -g @anthropic-ai/claude-code" >&2
-  echo "         (without it /godmode falls back to in-session subagents, max 50 agents)" >&2
-elif [ -n "$PY" ]; then
-  "$PY" "$DEST/scripts/godmode_engine.py" check || true
+  echo "NOTE: 'claude' is not on PATH here. That's fine inside Claude Desktop (it exposes its own binary);" >&2
+  echo "      for the terminal install Claude Code: npm install -g @anthropic-ai/claude-code" >&2
 fi
 
 cat <<MSG
 
-Done. Restart Claude Code (or open a new session), then run for example:
+Done. Restart Claude Code (or open a new Claude Desktop session), then try:
 
-  /godmode 10 Find the root cause of the flaky test in tests/api and propose a fix
+  /godmode 3 What is 17 * 23?
+  /godmode 10 Fix the flaky test in tests/api
 
 MSG

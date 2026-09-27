@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.8" }
+          - { os: ubuntu-latest, python: "3.12" }
+          - { os: macos-latest, python: "3.12" }
+          - { os: windows-latest, python: "3.12" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Configure git identity for fixtures
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.com
+      - name: Compile
+        run: python -m compileall -q skills/godmode/scripts tests
+      - name: Tests (no API calls; uses tests/fake_claude.py)
+        run: python -m unittest discover -s tests -v

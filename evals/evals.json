@@ -1,0 +1,40 @@
+[
+  {
+    "skills": ["godmode"],
+    "query": "/godmode 8 A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost? Give the answer in cents.",
+    "files": [],
+    "expected_behavior": [
+      "Runs preflight, writes a reason-mode manifest with agents=8 and an answer_key_spec asking for a bare number of cents",
+      "Runs the engine and reports 5 as the winner with its first-choice vote count out of 8",
+      "Does not modify any project files"
+    ]
+  },
+  {
+    "skills": ["godmode"],
+    "query": "/godmode 6 fix the failing test in evals/fixtures/calc_repo (calc.add returns the wrong result)",
+    "files": ["evals/fixtures/calc_repo/calc.py", "evals/fixtures/calc_repo/test_calc.py"],
+    "expected_behavior": [
+      "Uses mode=code with verify_command running test_calc.py and runs validate --baseline, which fails for the right reason",
+      "Every worker edits only its own worktree; the real repository is unchanged until apply",
+      "Reports a verified winner, then runs apply and the tests pass in the real repository",
+      "Runs clean at the end"
+    ]
+  },
+  {
+    "skills": ["godmode"],
+    "query": "/godmode abc do something",
+    "files": [],
+    "expected_behavior": [
+      "Rejects the invalid agent count with the usage line and does not start any agents"
+    ]
+  },
+  {
+    "skills": ["godmode"],
+    "query": "/godmode 600 design the caching layer for our API",
+    "files": [],
+    "expected_behavior": [
+      "Runs a 5-agent pilot first and shows the projected cost range",
+      "Asks the user to confirm before launching 600 agents because X >= 500, and suggests --budget"
+    ]
+  }
+]

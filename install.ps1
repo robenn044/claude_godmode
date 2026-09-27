@@ -49,10 +49,9 @@ Write-Host "Installed /godmode -> $Dest"
 $Py = $null
 foreach ($c in @("python", "py", "python3")) { if (Get-Command $c -ErrorAction SilentlyContinue) { $Py = $c; break } }
 if (-not $Py) { Write-Warning "Python 3.8+ not found. Install it from https://python.org (the swarm engine needs it)." }
+if ($Py) { & $Py (Join-Path $Dest "scripts\godmode_engine.py") preflight }
 if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
-  Write-Warning "'claude' CLI not on PATH. Install Claude Code: npm install -g @anthropic-ai/claude-code"
-} elseif ($Py) {
-  & $Py (Join-Path $Dest "scripts\godmode_engine.py") check
+  Write-Host "NOTE: 'claude' is not on PATH. Fine inside Claude Desktop; for the terminal: npm install -g @anthropic-ai/claude-code"
 }
 Write-Host ""
-Write-Host "Done. Restart Claude Code, then run e.g.:  /godmode 10 <your task>"
+Write-Host "Done. Restart Claude Code (or open a new Claude Desktop session), then try:  /godmode 3 What is 17 * 23?"

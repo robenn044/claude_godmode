@@ -1,17 +1,17 @@
 # claude_godmode: `/godmode` for Claude Code
 
-`/godmode` runs **1 to 10,000 independent Claude agents** on one task. Each agent has its own
-context, strategy and workflow. When they finish, **every agent votes**, and you get the solution
-with the **most votes**.
-
 ```
-/godmode X [prompt]
+/godmode X [prompt]          X = 1 … 10000 agents
 ```
 
+`/godmode` puts **X independent Claude agents** on one task. Each agent has its own context, its own strategy and its own private workspace. Their solutions are **verified** objectively and **merged** where equivalent. Then **every agent votes**, and the solution with the **most votes** wins. When the vote is contested, a refinement round runs automatically before a second vote.
+
+It is built for problems a single agent fails on, and to be economical at scale: the engine uses prompt caching, adapts to rate limits and resumes interrupted runs.
+
 ```
-/godmode 5 What's the cleanest way to add rate limiting to our Express API?
-/godmode 100 Find the root cause of the flaky test in tests/api/session.test.ts and fix it
-/godmode 1000 --concurrency 32 --budget 200 Write the best possible one-paragraph pitch for this repo
+/godmode 5 Why does our login redirect loop only in Safari? Find the root cause.
+/godmode 40 --effort xhigh Fix the flaky test tests/test_pool.py::test_concurrent_release
+/godmode 1000 --concurrency 32 --budget 300 Find the minimal weighings for 40 coins with unknown heavier/lighter fake
 ```
 
 ---
@@ -19,237 +19,186 @@ with the **most votes**.
 ## How it works
 
 ```
-                        ┌─────────────────────────────┐
-  /godmode X prompt ──▶ │  ORCHESTRATOR (main agent)  │  reads the codebase, writes the briefing,
-                        │  your Claude Code session   │  designs strategies × lenses, assigns work
-                        └──────────────┬──────────────┘
-                                       │ manifest.json
-                                       ▼
-                        ┌─────────────────────────────┐
-                        │   godmode_engine.py         │  runs `claude -p` processes in parallel
-                        └──────────────┬──────────────┘  (--concurrency), resumable, with a budget
-          ┌────────────┬───────────────┼───────────────┬────────────┐
-          ▼            ▼               ▼               ▼            ▼
-       agent 1      agent 2   ...   agent i   ...   agent X-1    agent X     1. SOLVE (read-only,
-       strat A      strat B         strat i%S       ...          ...           own session each)
-          └────────────┴───────────────┼───────────────┴────────────┘
-                                       ▼
-                    2. DEDUPE: identical answers are merged (they count as supporters)
-                                       ▼
-            3. QUALIFYING VOTE (only if >10 unique candidates): every agent resumes
-               its OWN session and votes on a shuffled, anonymised ballot of 8 OTHER
-               agents' solutions. The top 10 by vote share become finalists.
-                                       ▼
-            4. FINAL VOTE: every agent votes on the finalists → MOST VOTES WINS
-                                       ▼
-                        WINNER.md + report.json → the orchestrator presents the winner
-                        (and applies it, if you asked for a change to be made)
+ /godmode X prompt
+        │
+        ▼
+ ORCHESTRATOR (your Claude Code session)
+   recon → crux analysis → dead ends → 4-24 distinct strategy workflows,
+   judge angles, answer-key spec, verifier → manifest.json → validate → pilot
+        │
+        ▼
+ ENGINE  (skills/godmode/scripts/godmode_engine.py, Python stdlib)
+   1 SOLVE     X × `claude -p`, each with its own context, strategy × lens, and a private
+               git worktree (code) or scratch dir (reasoning). Shared brief = cached prefix.
+   2 VERIFY    verify_command runs in each worktree → PASSED/FAILED + output
+   3 CLUSTER   exact + semantic merge of equivalent answers (supporters pool together)
+   4 QUALIFY   (only if > 6 clusters) every agent ranks a balanced ballot of 6 OTHER clusters
+   5 FINAL     every agent votes on the ≤ 6 finalists → MOST FIRST-CHOICE VOTES WINS
+   6 REFINE    only if contested: ~10% of agents synthesise improved solutions from the
+               top candidates + voter critiques → re-cluster → every agent votes again
+        │
+        ▼
+ WINNER.md + report.json → orchestrator presents the result; `apply` patches your project
 ```
 
-- **One main agent organises everything.** The orchestrator is your Claude Code session running the
-  skill. It investigates the task, writes a shared briefing, invents 4 to 24 task-specific strategies
-  plus 2 to 6 lenses, and hands each agent its own combination and a unique variation seed. This
-  spreads even 10,000 agents across every approach.
-- **Each agent has its own context.** Every agent is a separate `claude -p` process with its own
-  session ID. At voting time, each agent resumes *its own* session, so it votes knowing what it
-  tried itself. Use `--fresh-voters` for cheaper, context-free voting.
-- **All agents vote.** Every agent votes in the final. Voting scales to 10,000 because the qualifying
-  round gives each agent a small, balanced ballot, and each candidate appears about the same number
-  of times.
-- **Workers are read-only.** They cannot edit files. Only the orchestrator applies the winner.
-- **Runs are resumable.** Everything is saved in `.godmode/runs/<timestamp>-<slug>/`. If a run is
-  interrupted, the same command resumes it.
+### Design choices and the research behind them
+
+| Choice | Why |
+|---|---|
+| **Verify before voting.** Code solutions are run against a test, and passing ones are preferred. | Plain majority voting plateaus, and can even get *worse* as calls increase on hard tasks. Filtering on execution closes much of the gap between "some agent found it" and "we picked it". Sources: Chen et al. 2024, *Are More LLM Calls All You Need?*; Brown et al. 2024, *Large Language Monkeys*; AlphaCode; CodeT. |
+| **Semantic clustering** of answer keys. | Equivalent answers phrased differently would otherwise split the vote. This is the idea behind Universal Self-Consistency. |
+| **Strategy diversity, not temperature.** The orchestrator writes distinct workflows. | Diverse plans beat repeated sampling. Sources: PlanSearch, DIV-SE. |
+| **Every agent votes from a fresh context, using its own judging angle.** | A voter doesn't know which candidate is its own, which removes self-preference bias (Panickssery et al. 2024). The different angles (correctness tracer, edge-case hunter and others) make the votes more independent. |
+| **Anonymised, rotated ballots.** Each finalist appears in every position equally often, and supporter counts are hidden. | Controls position bias and herding (Zheng et al. 2023). |
+| **Rubric first, then ranking.** | Checking each candidate against the criteria before comparing them resists distractors. |
+| **Adaptive refinement only when contested:** the winner has under 50% of votes, leads by under 15%, or fails verification. | Recursive Self-Aggregation and Self-MoA get gains from synthesis rounds. CATTS-style gating spends that compute only where it pays off. Open debate is avoided because it mostly adds nothing beyond voting (*Debate or Vote*, 2025). |
+| **Shared bytes first, per-agent bytes last.** A primer call runs first and the rest follow once it has started responding. Per-process flags are chosen for cross-process cache hits. | Anthropic's prompt caching serves a cache entry only after the first response begins. In a measured real run, each agent after the first cost about a third as much. |
+| An orchestrator–worker setup with explicit briefs: objective, output format, tools and boundaries. | Anthropic, *How we built our multi-agent research system*. |
 
 ---
 
 ## Installation (step by step)
 
-### Requirements
+### 1. Requirements
 
 | Requirement | Check | Install |
 |---|---|---|
-| Claude Code CLI | `claude --version` | `npm install -g @anthropic-ai/claude-code`, or the native installer from <https://claude.com/claude-code> |
-| Logged in to Claude Code | run `claude` once and sign in | `claude` then `/login` |
-| Python 3.8+ | `python3 --version` (Windows: `python --version`) | <https://python.org> or your package manager |
-| git (optional) | `git --version` | used by the installer; it falls back to `curl` |
+| Claude Code (CLI, or Claude Desktop with Claude Code) | `claude --version` | `npm install -g @anthropic-ai/claude-code`, or <https://claude.com/claude-code> |
+| Signed in | `claude` → `/login` | |
+| Python 3.8+ | `python3 --version` (Windows: `python --version`) | <https://python.org> |
+| git | `git --version` | Needed for code tasks: isolated worktrees and patches |
 
-### Option A: global install, available in every project (recommended)
+**Claude Desktop.** The Claude Code tab in Claude Desktop reads the same `~/.claude/skills` folder, so the global install below also covers Desktop. You don't need a separate `claude` on your PATH: the engine uses the Claude binary that Desktop is already running, found through `CLAUDE_CODE_EXECPATH`.
 
-This installs the skill to `~/.claude/skills/godmode/`, so `/godmode` works in every project and every
-Claude Code session: terminal, VS Code, JetBrains and the desktop app.
+### 2A. Global install (every project, CLI and Desktop). Recommended.
 
 **macOS / Linux / WSL**
-1. Open a terminal.
-2. Run:
-   ```bash
-   git clone https://github.com/robenn044/claude_godmode.git
-   cd claude_godmode
-   ./install.sh
-   ```
-   Or, without cloning:
-   ```bash
-   curl -fsSL https://raw.githubusercontent.com/robenn044/claude_godmode/main/install.sh | bash
-   ```
-3. The installer copies the skill to `~/.claude/skills/godmode/` and checks for Python and the `claude` CLI.
-4. **Restart Claude Code.** Exit any running session and start `claude` again.
-5. Type `/godmode` to check that it appears in the slash-command menu.
+```bash
+git clone https://github.com/robenn044/claude_godmode.git
+cd claude_godmode
+./install.sh                      # copies skills/godmode → ~/.claude/skills/godmode
+```
+Without cloning: `curl -fsSL https://raw.githubusercontent.com/robenn044/claude_godmode/main/install.sh | bash`
 
 **Windows (PowerShell)**
-1. Open PowerShell.
-2. Run:
-   ```powershell
-   git clone https://github.com/robenn044/claude_godmode.git
-   cd claude_godmode
-   powershell -ExecutionPolicy Bypass -File .\install.ps1
-   ```
-   Or, without cloning:
-   ```powershell
-   irm https://raw.githubusercontent.com/robenn044/claude_godmode/main/install.ps1 | iex
-   ```
-3. The skill is installed to `%USERPROFILE%\.claude\skills\godmode\`.
-4. Restart Claude Code and type `/godmode`.
+```powershell
+git clone https://github.com/robenn044/claude_godmode.git
+cd claude_godmode
+powershell -ExecutionPolicy Bypass -File .\install.ps1   # → %USERPROFILE%\.claude\skills\godmode
+```
+Without cloning: `irm https://raw.githubusercontent.com/robenn044/claude_godmode/main/install.ps1 | iex`
 
-**Manual install (any OS)**
-1. Copy the `skills/godmode` folder of this repo to `~/.claude/skills/godmode`, so that
-   `~/.claude/skills/godmode/SKILL.md` exists.
-2. Restart Claude Code.
+**Manual install:** copy `skills/godmode/` to `~/.claude/skills/godmode/`.
 
-### Option B: one project only (shared with your team through git)
+### 2B. One project only (shared with your team through git)
 
-From the root of the project:
 ```bash
 /path/to/claude_godmode/install.sh --project     # → ./.claude/skills/godmode
 git add .claude/skills/godmode && git commit -m "Add /godmode skill"
 ```
-Anyone who opens the project in Claude Code gets `/godmode`.
 
-### Option C: Claude Code plugin
+### 2C. As a plugin
 
-Inside Claude Code, run:
+Run these in Claude Code:
 ```
 /plugin marketplace add robenn044/claude_godmode
 /plugin install godmode@claude-godmode
 ```
-Restart Claude Code. Run it as `/godmode ...`, or as `/godmode:godmode ...` if another command
-already uses the name.
+Invoke it as `/godmode`, or as `/godmode:godmode` if the name clashes with another command.
 
-> **Installing from a branch before it is merged into `main`:** for the one-liners, add
-> `GODMODE_REF=<branch>` (bash), for example
-> `curl -fsSL .../<branch>/install.sh | GODMODE_REF=<branch> bash`, or pass `-Ref <branch>` to
-> `install.ps1`.
+> **Before this is merged into `main`:** install from the branch. After cloning, run `git checkout <branch>` before `./install.sh`. For the one-liners, fetch the branch's `install.sh` and pipe it to `GODMODE_REF=<branch> bash`, or pass `-Ref <branch>` to `install.ps1`.
 
-### Verify
+### 3. Verify the install
 
-```bash
-python3 ~/.claude/skills/godmode/scripts/godmode_engine.py check
-# claude CLI: /usr/local/bin/claude (2.x.x (Claude Code))
-```
-Then, in Claude Code:
-```
-/godmode 3 What is the capital of Australia?
-```
-The 3 agents should agree unanimously on Canberra.
+1. Restart Claude Code, or open a new Desktop session.
+2. Type `/` and check that `godmode` appears in the list.
+3. Run:
+   ```bash
+   python3 ~/.claude/skills/godmode/scripts/godmode_engine.py preflight
+   ```
+   It should print your Claude CLI path, version and features.
+4. Try a small run: `/godmode 3 What is 17 * 23?`
 
-### Update / uninstall
+### Update or uninstall
 
-```bash
-./install.sh              # re-run to update (overwrites the old copy)
-./install.sh --uninstall  # remove the global install   (--project --uninstall for per-project)
-```
-To remove the plugin, run `/plugin uninstall godmode@claude-godmode`.
+- Update: re-run `./install.sh`.
+- Uninstall: `./install.sh --uninstall` (add `--project` for a per-project install), or `/plugin uninstall godmode@claude-godmode`.
 
 ---
 
 ## Usage
 
-```
-/godmode X [options] <prompt>
-```
+| Flag | Meaning |
+|---|---|
+| `X` | Number of agents, **1 to 10000**. Exactly X agents solve and all X vote. |
+| `--model M` / `--vote-model M` | Model for solving and for voting, e.g. `opus`, `sonnet`, `haiku` or a full ID. |
+| `--effort E` | Worker effort: `low`, `medium`, `high`, `xhigh` or `max`. The orchestrator chooses one if you don't. |
+| `--concurrency N` | Maximum agents running at once. Default 8, maximum 256. It halves automatically on rate limits and recovers slowly. |
+| `--budget USD` | Hard spending stop. Re-run the same command later to resume. |
+| `--max-refine N` / `--no-refine` | Controls the adaptive refinement rounds. Default is at most 1. |
+| `--yes` | Skip the confirmation. Without it, you are asked to confirm when X ≥ 500 or the projected cost is over $50. |
+| `--native` | Run without the engine, using in-session subagents. Limited to 50 agents. |
 
-| Option | Default | Meaning |
-|---|---|---|
-| `X` | required | number of agents, **1 to 10,000** |
-| `--concurrency N` | 8 | agents running at the same time (max 256); raise it only if your rate limits allow |
-| `--model M` | your default | model for every agent, for example `sonnet`, `opus` or `haiku` |
-| `--budget USD` | none | hard spending stop; resume later with a higher budget |
-| `--fresh-voters` | off | vote in fresh contexts instead of each agent's own session (cheaper) |
-| `--native` | off | use in-session subagents instead of `claude -p` (max 50 agents) |
-| `--yes` | off | skip the confirmation that is asked for X ≥ 500 |
+**What you'll see in the terminal.**
+1. The orchestrator explores the task and writes the plan.
+2. For X ≥ 50, it runs a 5-agent pilot with a projected cost.
+3. It runs the swarm. Large runs go in the background, and you can ask for progress.
+4. It presents the winning solution, the vote table, the contest status, the verification result and the cost. For change requests, it applies the winning patch and runs your tests.
 
-If your prompt asks for a change (fix, implement, refactor), the orchestrator **applies the winning
-solution** and runs your checks. Otherwise it only reports the winner.
+### Cost and speed
 
-### Cost and time
+- **Calls.** Calls ≈ X (solve) + X (final vote) + up to X (qualifying round, only when there are more than 6 distinct answers). A refinement round, only when contested, adds about 0.1·X solves plus X votes. Unanimous runs skip voting entirely.
+- **What makes votes cheap.** Votes are cheap, tool-less calls with a short system prompt. The ballot is shared by ~X/6 voters, so it is cached.
+- **Measured.** Real runs with 4 agents cost $0.50 to $1.00, with a 54–90% cache hit rate.
+- **Estimating.** Solve cost dominates and scales linearly. Use the pilot's projection, set `--budget`, and choose a cheaper `--model` or `--vote-model` for large X.
 
-A run makes about **3 × X Claude calls**: X to solve, X in the qualifying vote, X in the final.
-Runs with 10 or fewer unique answers skip the qualifying vote, and unanimous runs skip voting
-entirely. Cost grows linearly with X:
+### Run directory: `.godmode/runs/<timestamp>-<slug>/`
 
-- 10 agents is a normal "careful" run.
-- 100 agents is a meaningful spend.
-- 1,000 to 10,000 agents can cost hundreds to thousands of dollars and take hours.
+This directory is hidden from `git status` through `.git/info/exclude`.
 
-For large runs, use `--budget`, a cheaper `--model`, and `--fresh-voters`. You can check progress at any time:
+| Path | Contents |
+|---|---|
+| `manifest.json` | The orchestrator's plan: brief, strategies, lenses, judge angles, criteria, verifier. |
+| `shared_brief.md` | The identical, cached system-prompt addition every solver receives. |
+| `agents/agent-NNNNN/` | Each agent's prompt, `result.json` (answer key, solution, confidence, verification) and `patch.diff`. |
+| `clusters/rN.json` | Clusters for each round. |
+| `votes/qN/*.json`, `votes/fN/*.json` | Every ballot, with ranking, per-candidate verdicts and reason. |
+| `refine/rN/…` | Solutions from refinement round N. |
+| `report.json`, `WINNER.md` | The result. |
+| `engine.log`, `progress.json` | Audit trail and progress. |
+
+### Using the engine directly
+
 ```bash
-python3 ~/.claude/skills/godmode/scripts/godmode_engine.py status --run-dir .godmode/runs/<run>
+E=~/.claude/skills/godmode/scripts/godmode_engine.py
+python3 $E validate --run-dir RUN --baseline      # check the manifest; test the verifier on the snapshot
+python3 $E run      --run-dir RUN --pilot 5       # solve 5 agents only, print projected cost
+python3 $E run      --run-dir RUN --concurrency 16 --budget 50
+python3 $E status   --run-dir RUN
+python3 $E apply    --run-dir RUN                 # apply the winning patch to the project
+python3 $E clean    --run-dir RUN                 # remove worktrees and the snapshot ref
 ```
-
-### What a run leaves behind
-
-```
-.godmode/runs/20260927-152625-dotfiles-name/
-├── manifest.json         # the orchestrator's plan: brief, strategies, lenses, criteria
-├── agents/agent-00001/   # prompt.md, raw_solve.md, solution.md, meta.json (session, strategy, votes)
-├── candidates.json       # unique solutions and who wrote them
-├── votes/round1/*.json   # qualifying ballots and votes (with reasons)
-├── votes/final/*.json    # final ballots and votes (with reasons)
-├── report.json           # full tally, cost, failures
-└── WINNER.md             # the winning solution and a vote table
-```
-`.godmode/` is added to `.gitignore` automatically.
+The manifest format is described in [`skills/godmode/references/manifest.md`](skills/godmode/references/manifest.md). Run `run --help` to see every option.
 
 ---
 
-## Using the engine directly (without the skill)
+## Safety model
+
+- Workers get full autonomy (`acceptEdits` plus an allowlist of every built-in tool), but only inside their **own** worktree. The worktree is built from a snapshot of your current tree, including uncommitted and untracked files, using a temporary git index. Your real index, HEAD and working tree are never touched.
+- Only the orchestrator's `apply` modifies your project.
+- Workers can't spawn subagents or start another swarm, and MCP servers are off unless the manifest enables them.
+
+## Development
 
 ```bash
-mkdir -p .godmode/runs/demo
-cat > .godmode/runs/demo/manifest.json <<'JSON'
-{
-  "task": "Suggest a name for a dotfiles sync CLI",
-  "agents": 20,
-  "brief": "Short, typeable, no clashes with existing tools.",
-  "strategies": [{"name": "Wordplay", "instructions": "Pun on home/dot/rc"},
-                 {"name": "Metaphor", "instructions": "Real word evoking travel/home"}],
-  "lenses": ["Memorability", "Uniqueness"],
-  "criteria": ["Memorable", "Easy to type", "Evokes the purpose"],
-  "solution_format": "Name on line 1, tagline on line 2."
-}
-JSON
-python3 skills/godmode/scripts/godmode_engine.py run --run-dir .godmode/runs/demo --concurrency 8
+python3 -m unittest discover -s tests -v     # 30+ tests, no API calls (tests/fake_claude.py)
+claude plugin validate .
 ```
-Run `python3 skills/godmode/scripts/godmode_engine.py run --help` to see every option (`--ballot-size`,
-`--finalists`, `--timeout`, `--retries`, `--max-turns`, `--dry-run`, and more).
-
-## Tests
-
-The tests use a fake `claude` binary, so they make no API calls:
-```bash
-python3 -m unittest discover -s tests -v
-```
+CI runs the suite on Linux, macOS and Windows. [`evals/`](evals/) contains orchestrator scenarios in the Agent Skills evaluation format.
 
 ## Troubleshooting
 
-- **`/godmode` doesn't appear.** Restart Claude Code, then check that
-  `~/.claude/skills/godmode/SKILL.md` exists (or `.claude/skills/godmode/SKILL.md` in the project).
-- **"claude CLI: NOT FOUND".** Put `claude` on your `PATH`, or set `GODMODE_CLAUDE_BIN=/path/to/claude`.
-  Without it, the skill falls back to in-session subagents, which are limited to 50 agents.
-- **Rate limit errors.** Lower `--concurrency`. Failed calls are retried with backoff, and re-running
-  the command resumes the swarm.
-- **Budget reached (exit code 3).** Re-run with a higher `--budget`. Finished work is kept.
-- **Disk usage.** Each agent keeps its session under `~/.claude/projects/` so it can vote with its own
-  context. Use `--fresh-voters` to avoid resuming sessions. The engine flag
-  `--no-session-persistence` also stops sessions from being saved at all.
+See [`skills/godmode/references/troubleshooting.md`](skills/godmode/references/troubleshooting.md).
 
 ## License
 
